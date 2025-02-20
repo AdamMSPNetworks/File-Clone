@@ -53,10 +53,10 @@ function Select-Drive() {
     if ($choice -match "^\d+$" -and [int]$choice -gt 0 -and [int]$choice -le $drives.Count) {
         return $drives[[int]$choice - 1].Root
     } else {
-        Write-Host "Invalid selection." -ForegroundColor Red
-        return $null
+        Write-Host "Invalid selection. Please try again." -ForegroundColor Red
     }
 }
+
 
 # Function to copy files with a progress bar and error handling
 function Copy-Files($sourceFolders, $destination) {
@@ -78,7 +78,7 @@ function Copy-Files($sourceFolders, $destination) {
             Write-Host "Skipping $folder (DFS or OneDrive detected or does not exist)"
         }
         $currentFolder++
-        Write-Progress -Activity "Backing up files" -Status "$folder" -PercentComplete (($currentFolder / $totalFolders) * 100)
+        Write-Progress -Activity "Backing up files" -Status "Processing $folder" -PercentComplete (($currentFolder / $totalFolders) * 100)
     }
 }
 
@@ -158,10 +158,17 @@ function Restore() {
 }
 
 # Main Menu
-$action = Read-Host "Do you want to (B)ackup or (R)restore?"
-if ($action -eq 'B') {
+Clear-Host
+Write-Host "===============================" -ForegroundColor Cyan
+Write-Host "   FILE CLONE BACKUP & RESTORE" -ForegroundColor Green
+Write-Host "===============================" -ForegroundColor Cyan
+Write-Host "[B] Backup Files" -ForegroundColor Yellow
+Write-Host "[R] Restore Files" -ForegroundColor Yellow
+Write-Host "[Q] Quit" -ForegroundColor Yellow
+$action = Read-Host "Please select an option (B/R/Q)"
+if ($action -ieq 'B') {
     Backup
-} elseif ($action -eq 'R') {
+} elseif ($action -ieq 'R') {
     Restore
 } else {
     Write-Host "Invalid choice." -ForegroundColor Red
