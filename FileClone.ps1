@@ -389,6 +389,142 @@ function Find-ExternalDrive() {
     }
 }
 
+# Function to backup printers and drivers (using Printbrm.exe like Print Management / printmanagement.msc)
+function Backup-Printers($backupFolder) {
+    Write-Host "`nBacking up printers and drivers..." -ForegroundColor Cyan
+    
+    try {
+        $printers = @()
+        $drivers = @()
+        $ports = @()
+        
+        # Get all printers for JSON manifest and count
+        $allPrinters = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "Microsoft XPS*" -and $_.Name -notlike "Send To*" }
+        
+        if ($allPrinters.Count -eq 0) {
+            Write-Host "  No printers found to backup." -ForegroundColor Yellow
+            return $true
+        }
+        
+        Write-Host "  Found $($allPrinters.Count) printer(s)..." -ForegroundColor Gray
+        
+        # Use Printbrm.exe (same engine as printmanagement.msc) to export printers WITH driver files
+        $printbrmPath = Join-Path $env:windir "System32\spool\tools\printbrm.exe"
+        $exportFile = Join-Path $backupFolder "Printers.printerExport"
+        
+        if (Test-Path $printbrmPath) {
+            # Printbrm does not support paths with spaces; use temp path if needed then copy
+            $pathHasSpaces = $backupFolder -match ' '
+            $targetPath = $exportFile
+            
+            if ($pathHasSpaces) {
+                $tempExport = Join-Path $env:TEMP "FileClonePrinters.printerExport"
+                $targetPath = $tempExport
+                Write-Host "  Backup path contains spaces; using temp location then copying..." -ForegroundColor Gray
+            }
+            
+            try {
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = $printbrmPath
+                $psi.Arguments = "-b -f `"$targetPath`" -o force"
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $p = [System.Diagnostics.Process]::Start($psi)
+                $out = $p.StandardOutput.ReadToEnd()
+                $err = $p.StandardError.ReadToEnd()
+                $p.WaitForExit(120000)
+                
+                if ($p.ExitCode -eq 0) {
+                    if ($pathHasSpaces -and (Test-Path $tempExport)) {
+                        Copy-Item -Path $tempExport -Destination $exportFile -Force
+                        Remove-Item -Path $tempExport -Force -ErrorAction SilentlyContinue
+                    }
+                    Write-Host "  Printers and drivers backed up with Printbrm (like Print Management): Printers.printerExport" -ForegroundColor Green
+                    Write-Host "  This file includes printer definitions and driver files for restore." -ForegroundColor Gray
+                } else {
+                    Write-Host "  Printbrm backup returned exit code $($p.ExitCode); saving JSON manifest only." -ForegroundColor Yellow
+                    if ($err) { Write-Host "  $err" -ForegroundColor Gray }
+                }
+            } catch {
+                Write-Host "  Printbrm backup failed: $($_.Exception.Message); saving JSON manifest only." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  Printbrm.exe not found; saving printer list and driver metadata only (no driver files)." -ForegroundColor Yellow
+        }
+        
+        # Build JSON manifest (printer list + driver/port metadata) for reference and fallback restore
+        foreach ($printer in $allPrinters) {
+            $printerInfo = @{
+                Name = $printer.Name
+                DriverName = $printer.DriverName
+                PortName = $printer.PortName
+                Shared = $printer.Shared
+                ShareName = $printer.ShareName
+                Location = $printer.Location
+                Comment = $printer.Comment
+                PrinterStatus = $printer.PrinterStatus
+                Published = $printer.Published
+            }
+            
+            try {
+                $port = Get-PrinterPort -Name $printer.PortName -ErrorAction SilentlyContinue
+                if ($port -and -not ($ports | Where-Object { $_.Name -eq $port.Name })) {
+                    $ports += @{
+                        Name = $port.Name
+                        Description = $port.Description
+                        PrinterHostAddress = $port.PrinterHostAddress
+                        PortNumber = $port.PortNumber
+                        SNMPEnabled = $port.SNMPEnabled
+                        SNMPCommunity = $port.SNMPCommunity
+                        SNMPDeviceIndex = $port.SNMPDeviceIndex
+                    }
+                }
+            } catch { }
+            
+            try {
+                $driver = Get-PrinterDriver -Name $printer.DriverName -ErrorAction SilentlyContinue
+                if ($driver -and -not ($drivers | Where-Object { $_.Name -eq $driver.Name })) {
+                    $drivers += @{
+                        Name = $driver.Name
+                        PrinterEnvironment = $driver.PrinterEnvironment
+                        DriverPath = $driver.DriverPath
+                        ConfigFile = $driver.ConfigFile
+                        DataFile = $driver.DataFile
+                        HelpFile = $driver.HelpFile
+                        InfPath = $driver.InfPath
+                        MajorVersion = $driver.MajorVersion
+                        MinorVersion = $driver.MinorVersion
+                    }
+                }
+            } catch { }
+            
+            $printers += $printerInfo
+        }
+        
+        $printerBackup = @{
+            Printers = $printers
+            Drivers = $drivers
+            Ports = $ports
+            BackupDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            ComputerName = $env:COMPUTERNAME
+        }
+        
+        $printerBackupPath = Join-Path $backupFolder "Printers.json"
+        $printerBackup | ConvertTo-Json -Depth 10 | Set-Content -Path $printerBackupPath -Force
+        
+        Write-Host "  Printers: $($printers.Count) | Drivers (metadata): $($drivers.Count) | Ports: $($ports.Count)" -ForegroundColor Green
+        Write-Host "  Manifest saved to: Printers.json" -ForegroundColor Green
+        
+        return $true
+    } catch {
+        Write-Host "  Error backing up printers: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Run as Administrator for full printer/driver backup." -ForegroundColor Yellow
+        return $false
+    }
+}
+
 # Function to create restore script in backup folder
 function Create-RestoreScript($backupFolder) {
     $restoreScript = @"
@@ -481,6 +617,121 @@ foreach (`$folder in `$FoldersToRestore) {
 }
 
 Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Restoring Printers..." -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+`$printerExportPath = "`$backupPath\Printers.printerExport"
+`$printerJsonPath = "`$backupPath\Printers.json"
+
+# Prefer Printbrm restore (same as Print Management: restores printers AND driver files)
+if (Test-Path `$printerExportPath) {
+    Write-Host "Found Printers.printerExport (full backup with drivers, like Print Management)." -ForegroundColor Cyan
+    
+    `$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not `$isAdmin) {
+        Write-Host "  Warning: Run as Administrator to restore printers and drivers." -ForegroundColor Yellow
+    } else {
+        `$printbrmPath = Join-Path `$env:windir "System32\spool\tools\printbrm.exe"
+        if (Test-Path `$printbrmPath) {
+            # Printbrm does not support paths with spaces; use temp copy if needed
+            `$pathHasSpaces = `$printerExportPath -match ' '
+            `$restorePath = `$printerExportPath
+            if (`$pathHasSpaces) {
+                `$tempRestore = Join-Path `$env:TEMP "FileClonePrinters.printerExport"
+                Copy-Item -Path `$printerExportPath -Destination `$tempRestore -Force
+                `$restorePath = `$tempRestore
+            }
+            try {
+                `$psi = New-Object System.Diagnostics.ProcessStartInfo
+                `$psi.FileName = `$printbrmPath
+                `$psi.Arguments = "-r -f `"`$restorePath`" -o force"
+                `$psi.UseShellExecute = `$false
+                `$psi.CreateNoWindow = `$true
+                `$psi.RedirectStandardOutput = `$true
+                `$psi.RedirectStandardError = `$true
+                `$p = [System.Diagnostics.Process]::Start(`$psi)
+                `$p.WaitForExit(120000)
+                if (`$p.ExitCode -eq 0) {
+                    Write-Host "  Printers and drivers restored successfully (Printbrm)." -ForegroundColor Green
+                } else {
+                    Write-Host "  Printbrm restore returned exit code `$(`$p.ExitCode)." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "  Printbrm restore failed: `$(`$_.Exception.Message)" -ForegroundColor Red
+            }
+            if (`$pathHasSpaces -and (Test-Path `$tempRestore)) { Remove-Item `$tempRestore -Force -ErrorAction SilentlyContinue }
+        } else {
+            Write-Host "  Printbrm.exe not found; cannot restore from .printerExport." -ForegroundColor Yellow
+        }
+    }
+} elseif (Test-Path `$printerJsonPath) {
+    Write-Host "Found printer manifest (Printers.json); restoring printers (drivers must be installed if missing)..." -ForegroundColor Cyan
+    
+    try {
+        `$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not `$isAdmin) {
+            Write-Host "  Warning: Not running as Administrator. Printer restore may fail." -ForegroundColor Yellow
+        }
+        
+        `$printerBackup = Get-Content -Path `$printerJsonPath -Raw | ConvertFrom-Json
+        
+        # Restore ports (ensure array for single vs multiple ports)
+        `$portsList = @(`$printerBackup.Ports)
+        if (`$portsList -and `$portsList.Count -gt 0) {
+            foreach (`$port in `$portsList) {
+                if (-not `$port -or -not `$port.Name) { continue }
+                try {
+                    `$existingPort = Get-PrinterPort -Name `$port.Name -ErrorAction SilentlyContinue
+                    if (-not `$existingPort) {
+                        if (`$port.PrinterHostAddress) {
+                            Add-PrinterPort -Name `$port.Name -PrinterHostAddress `$port.PrinterHostAddress -PortNumber $(if (`$port.PortNumber) { `$port.PortNumber } else { 9100 }) -ErrorAction Stop
+                        } else {
+                            Add-PrinterPort -Name `$port.Name -ErrorAction Stop
+                        }
+                    }
+                } catch { }
+            }
+        }
+        
+        `$restoredCount = 0
+        `$failedCount = 0
+        `$printersList = @(`$printerBackup.Printers)
+        foreach (`$printer in `$printersList) {
+            if (-not `$printer -or -not `$printer.Name) { continue }
+            try {
+                if (Get-Printer -Name `$printer.Name -ErrorAction SilentlyContinue) { continue }
+                `$portExists = Get-PrinterPort -Name `$printer.PortName -ErrorAction SilentlyContinue
+                if (-not `$portExists -and `$printer.PortName -match '^\d+\.\d+\.\d+\.\d+') {
+                    Add-PrinterPort -Name `$printer.PortName -PrinterHostAddress `$printer.PortName -PortNumber 9100 -ErrorAction SilentlyContinue
+                }
+                `$driverExists = Get-PrinterDriver -Name `$printer.DriverName -ErrorAction SilentlyContinue
+                if (-not `$driverExists) {
+                    Write-Host "  Driver `$(`$printer.DriverName) not found for `$(`$printer.Name); skip or install driver." -ForegroundColor Yellow
+                    `$failedCount++
+                    continue
+                }
+                `$printerArgs = @{ Name = `$printer.Name; DriverName = `$printer.DriverName; PortName = `$printer.PortName }
+                if (`$printer.Shared) { `$printerArgs.Shared = `$true; if (`$printer.ShareName) { `$printerArgs.ShareName = `$printer.ShareName } }
+                if (`$printer.Location) { `$printerArgs.Location = `$printer.Location }; if (`$printer.Comment) { `$printerArgs.Comment = `$printer.Comment }
+                Add-Printer @printerArgs -ErrorAction Stop
+                Write-Host "  Printer `$(`$printer.Name) restored." -ForegroundColor Green
+                `$restoredCount++
+            } catch {
+                Write-Host "  Error restoring `$(`$printer.Name): `$(`$_.Exception.Message)" -ForegroundColor Red
+                `$failedCount++
+            }
+        }
+        Write-Host "  Restored: `$restoredCount | Failed: `$failedCount" -ForegroundColor Cyan
+    } catch {
+        Write-Host "  Error restoring from JSON: `$(`$_.Exception.Message)" -ForegroundColor Red
+    }
+} else {
+    Write-Host "No printer backup found (Printers.printerExport or Printers.json)." -ForegroundColor Yellow
+}
+
+Write-Host ""
 Write-Host "Restore completed!" -ForegroundColor Green
 Write-Host "Press any key to exit..."
 `$null = `$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -519,6 +770,9 @@ function Backup-Files() {
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         return
     }
+    
+    # Backup printers and drivers first
+    Backup-Printers $backupFolder
     
     # Create restore script
     Create-RestoreScript $backupFolder
