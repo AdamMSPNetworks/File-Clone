@@ -82,7 +82,7 @@ function Get-FileCount($path) {
     }
 }
 
-# Function to verify copied files
+# Function to verify copied files (count, size per file, and total data - ensures files have real data, not empty shells)
 function Verify-Copy($sourcePath, $destPath) {
     try {
         $sourceFiles = Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue
@@ -92,7 +92,7 @@ function Verify-Copy($sourcePath, $destPath) {
         $destCount = $destFiles.Count
         
         if ($sourceCount -eq 0 -and $destCount -eq 0) {
-            return @{ Success = $true; Message = "Empty folder" }
+            return @{ Success = $true; Message = "Empty folder"; TotalBytes = 0 }
         }
         
         if ($sourceCount -ne $destCount) {
@@ -102,9 +102,12 @@ function Verify-Copy($sourcePath, $destPath) {
             }
         }
         
-        # Verify file sizes match
+        # Verify each file exists at destination and has same size (catches "created with no data")
         $mismatches = 0
+        $sourceTotalBytes = 0
+        $destTotalBytes = 0
         foreach ($sourceFile in $sourceFiles) {
+            $sourceTotalBytes += $sourceFile.Length
             $relativePath = $sourceFile.FullName.Substring($sourcePath.Length + 1)
             $destFile = Join-Path $destPath $relativePath
             
@@ -113,29 +116,40 @@ function Verify-Copy($sourcePath, $destPath) {
                 continue
             }
             
-            $sourceSize = $sourceFile.Length
-            $destSize = (Get-Item $destFile).Length
+            $destItem = Get-Item $destFile -ErrorAction SilentlyContinue
+            $destSize = if ($destItem) { $destItem.Length } else { 0 }
+            $destTotalBytes += $destSize
             
-            if ($sourceSize -ne $destSize) {
+            if ($sourceFile.Length -ne $destSize) {
                 $mismatches++
+            }
+        }
+        
+        # Explicit check: source had data but destination is empty (files created with no data)
+        if ($sourceTotalBytes -gt 0 -and $destTotalBytes -eq 0) {
+            return @{ 
+                Success = $false; 
+                Message = "Destination has no data - files may be empty. Source had $([math]::Round($sourceTotalBytes/1MB, 2)) MB." 
             }
         }
         
         if ($mismatches -gt 0) {
             return @{ 
                 Success = $false; 
-                Message = "$mismatches file(s) have size mismatches" 
+                Message = "$mismatches file(s) size mismatch or missing (data not fully transferred)" 
             }
         }
         
-        return @{ Success = $true; Message = "All $sourceCount files verified" }
+        $sizeStr = if ($sourceTotalBytes -ge 1GB) { "$([math]::Round($sourceTotalBytes/1GB, 2)) GB" } elseif ($sourceTotalBytes -ge 1MB) { "$([math]::Round($sourceTotalBytes/1MB, 2)) MB" } else { "$([math]::Round($sourceTotalBytes/1KB, 2)) KB" }
+        return @{ Success = $true; Message = "All $sourceCount files verified ($sizeStr)"; TotalBytes = $sourceTotalBytes }
     } catch {
         return @{ Success = $false; Message = "Verification error: $($_.Exception.Message)" }
     }
 }
 
 # Function to copy files with progress bar using robocopy
-function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
+# $verifyWritten: if $true, add /V so robocopy verifies written data (use for critical folders like Documents)
+function Copy-FilesWithProgress($sourcePath, $destPath, $folderName, [switch]$verifyWritten) {
     try {
         # Get all files to copy
         $allFiles = Get-ChildItem -Path $sourcePath -Recurse -File -ErrorAction SilentlyContinue
@@ -156,6 +170,9 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
         # Create destination directory structure
         New-Item -ItemType Directory -Path $destPath -Force | Out-Null
         
+        if ($verifyWritten) {
+            Write-Host "  Using robocopy with /V (verify written data) for this folder." -ForegroundColor Cyan
+        }
         Write-Host "  Starting robocopy of $totalFiles files ($totalSizeGB GB total)..." -ForegroundColor Gray
         Write-Host "  Press [C] to Cancel" -ForegroundColor Cyan
         Write-Host ""
@@ -186,18 +203,8 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
         } -ArgumentList $inputFile
         
         # Use robocopy with multi-threading and optimized settings for maximum speed
-        # /MT:4 = 4 threads (can increase to 8 if needed, but 4 is usually optimal)
-        # /R:1 = retry 1 time (faster than default 1 million retries)
-        # /W:1 = wait 1 second between retries (faster)
-        # /J = use unbuffered I/O (faster for large files, bypasses cache)
-        # /FFT = assume FAT file times (2 second precision, faster than NTFS precision checks)
-        # /256 = use 256KB buffer size (larger buffer = faster transfers)
-        # /NP = no progress percentage (reduces overhead)
-        # /NDL = no directory list (reduces output overhead)
-        # /NFL = no file list (reduces output overhead)
-        # /NJH = no job header (reduces output overhead)
-        # /NJS = no job summary (reduces output overhead)
-        
+        # /V = verify written data (slower but ensures data integrity - used for Documents)
+        # /MT:4 = 4 threads; /R:1 /W:1 = retry; /J = unbuffered I/O; /FFT = FAT times; /256 = buffer
         $robocopyArgs = @(
             "`"$sourcePath`"",
             "`"$destPath`"",
@@ -214,6 +221,9 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
             "/NJH",          # No job header
             "/NJS"           # No job summary
         )
+        if ($verifyWritten) {
+            $robocopyArgs += "/V"   # Verify written data
+        }
         
         # Start robocopy process
         $robocopyProcess = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -NoNewWindow -PassThru
@@ -465,6 +475,27 @@ function Backup-Printers($backupFolder) {
 # Key files to backup for Chrome/Edge (bookmarks, preferences, passwords)
 $BrowserProfileFiles = @("Bookmarks", "Bookmarks.bak", "Preferences", "Secure Preferences", "Web Data", "Login Data", "Login Data-journal")
 
+# Check if Chrome or Edge is running
+function Test-BrowserProcessRunning() {
+    $chrome = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
+    $edge = Get-Process -Name "msedge" -ErrorAction SilentlyContinue
+    return (@($chrome) + @($edge) | Where-Object { $_ }).Count -gt 0
+}
+
+# Force-close Chrome and Edge so backup/restore can run without triggering "Chrome reset bookmarks" protection
+function Stop-BrowserProcesses() {
+    $closed = @()
+    try {
+        Get-Process -Name "chrome" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue; $closed += "Chrome" }
+        Get-Process -Name "msedge" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue; $closed += "Edge" }
+        if ($closed.Count -gt 0) {
+            Start-Sleep -Seconds 2
+            return $true
+        }
+    } catch { }
+    return $false
+}
+
 # Function to backup Chrome bookmarks, profile data, and passwords
 function Backup-Chrome($backupFolder) {
     $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
@@ -577,55 +608,73 @@ function Backup-InstalledApps($backupFolder) {
     }
 }
 
-# Function to backup C:\Scans or C:\scans if present
+# Function to backup C:\Scans or C:\scans if present; returns verification result for summary
 function Backup-Scans($backupFolder) {
     $scansPath = $null
     if (Test-Path "C:\Scans") { $scansPath = "C:\Scans" }
     elseif (Test-Path "C:\scans") { $scansPath = "C:\scans" }
     if (-not $scansPath) {
         Write-Host "  C:\Scans folder not found, skipping." -ForegroundColor Gray
-        return
+        return $null
     }
     $destScans = Join-Path $backupFolder "Scans"
     $fileCount = (Get-ChildItem -Path $scansPath -Recurse -File -ErrorAction SilentlyContinue).Count
     if ($fileCount -eq 0) {
         New-Item -ItemType Directory -Path $destScans -Force | Out-Null
         Write-Host "  Backed up Scans folder (empty)." -ForegroundColor Green
-        return
+        return @{ Folder = "Scans"; Status = "Success"; Message = "Empty folder" }
     }
     Write-Host "  Copying Scans folder ($fileCount files)..." -ForegroundColor Gray
     $robocopyArgs = @("`"$scansPath`"", "`"$destScans`"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
     $proc = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait
     if ($proc.ExitCode -le 7) {
-        Write-Host "  Backed up Scans folder ($fileCount files)." -ForegroundColor Green
+        Write-Host "  Verifying Scans copy (file count and sizes)..." -ForegroundColor Gray
+        $verifyResult = Verify-Copy -sourcePath $scansPath -destPath $destScans
+        if ($verifyResult.Success) {
+            Write-Host "  Scans backed up and verified: $($verifyResult.Message)" -ForegroundColor Green
+            return @{ Folder = "Scans"; Status = "Success"; Message = $verifyResult.Message }
+        } else {
+            Write-Host "  Scans copy completed but verification failed: $($verifyResult.Message)" -ForegroundColor Red
+            return @{ Folder = "Scans"; Status = "Failed"; Message = $verifyResult.Message }
+        }
     } else {
         Write-Host "  Scans backup had errors (robocopy exit $($proc.ExitCode))." -ForegroundColor Yellow
+        return @{ Folder = "Scans"; Status = "Failed"; Message = "Robocopy exit $($proc.ExitCode)" }
     }
 }
 
-# Function to backup C:\Boardmaker or C:\boardmaker if present
+# Function to backup C:\Boardmaker or C:\boardmaker if present; returns verification result for summary
 function Backup-Boardmaker($backupFolder) {
     $boardmakerPath = $null
     if (Test-Path "C:\Boardmaker") { $boardmakerPath = "C:\Boardmaker" }
     elseif (Test-Path "C:\boardmaker") { $boardmakerPath = "C:\boardmaker" }
     if (-not $boardmakerPath) {
         Write-Host "  C:\Boardmaker folder not found, skipping." -ForegroundColor Gray
-        return
+        return $null
     }
     $destBoardmaker = Join-Path $backupFolder "Boardmaker"
     $fileCount = (Get-ChildItem -Path $boardmakerPath -Recurse -File -ErrorAction SilentlyContinue).Count
     if ($fileCount -eq 0) {
         New-Item -ItemType Directory -Path $destBoardmaker -Force | Out-Null
         Write-Host "  Backed up Boardmaker folder (empty)." -ForegroundColor Green
-        return
+        return @{ Folder = "Boardmaker"; Status = "Success"; Message = "Empty folder" }
     }
     Write-Host "  Copying Boardmaker folder ($fileCount files)..." -ForegroundColor Gray
     $robocopyArgs = @("`"$boardmakerPath`"", "`"$destBoardmaker`"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
     $proc = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait
     if ($proc.ExitCode -le 7) {
-        Write-Host "  Backed up Boardmaker folder ($fileCount files)." -ForegroundColor Green
+        Write-Host "  Verifying Boardmaker copy (file count and sizes)..." -ForegroundColor Gray
+        $verifyResult = Verify-Copy -sourcePath $boardmakerPath -destPath $destBoardmaker
+        if ($verifyResult.Success) {
+            Write-Host "  Boardmaker backed up and verified: $($verifyResult.Message)" -ForegroundColor Green
+            return @{ Folder = "Boardmaker"; Status = "Success"; Message = $verifyResult.Message }
+        } else {
+            Write-Host "  Boardmaker copy completed but verification failed: $($verifyResult.Message)" -ForegroundColor Red
+            return @{ Folder = "Boardmaker"; Status = "Failed"; Message = $verifyResult.Message }
+        }
     } else {
         Write-Host "  Boardmaker backup had errors (robocopy exit $($proc.ExitCode))." -ForegroundColor Yellow
+        return @{ Folder = "Boardmaker"; Status = "Failed"; Message = "Robocopy exit $($proc.ExitCode)" }
     }
 }
 
@@ -759,12 +808,19 @@ if ((Test-Path `$printersCsv) -and -not `$printBrmSucceeded) {
 }
 if (-not (Test-Path `$printersDir)) { Write-Host "No printer backup found, skipping." -ForegroundColor Gray }
 
-# Restore Chrome and Edge (bookmarks, profiles, passwords - close browsers first)
+# Restore Chrome and Edge (force-close first so Chrome does not reset bookmarks when it detects changed files)
+`$chromeRunning = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
+`$edgeRunning = Get-Process -Name "msedge" -ErrorAction SilentlyContinue
+if (`$chromeRunning -or `$edgeRunning) {
+    Write-Host "Closing Chrome and Edge so browser data can be restored safely..." -ForegroundColor Cyan
+    Get-Process -Name "chrome" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id `$_.Id -Force -ErrorAction SilentlyContinue }
+    Get-Process -Name "msedge" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id `$_.Id -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+}
 `$chromeBackup = "`$backupPath\Chrome"
 `$chromeUserData = Join-Path `$env:LOCALAPPDATA "Google\Chrome\User Data"
 if (Test-Path `$chromeBackup) {
     Write-Host "Restoring Chrome (bookmarks, profiles, passwords)..." -ForegroundColor Cyan
-    Write-Host "  (Close Chrome if it is running)" -ForegroundColor Gray
     if (-not (Test-Path `$chromeUserData)) { New-Item -ItemType Directory -Path `$chromeUserData -Force | Out-Null }
     `$chromeProfiles = Get-ChildItem -Path `$chromeBackup -Directory -ErrorAction SilentlyContinue
     foreach (`$prof in `$chromeProfiles) {
@@ -778,13 +834,10 @@ if (Test-Path `$chromeBackup) {
 } else {
     Write-Host "No Chrome backup found, skipping." -ForegroundColor Gray
 }
-
-# Restore Edge bookmarks, profile data, and passwords
 `$edgeBackup = "`$backupPath\Edge"
 `$edgeUserData = Join-Path `$env:LOCALAPPDATA "Microsoft\Edge\User Data"
 if (Test-Path `$edgeBackup) {
     Write-Host "Restoring Edge (bookmarks, profiles, passwords)..." -ForegroundColor Cyan
-    Write-Host "  (Close Edge if it is running)" -ForegroundColor Gray
     if (-not (Test-Path `$edgeUserData)) { New-Item -ItemType Directory -Path `$edgeUserData -Force | Out-Null }
     `$edgeProfiles = Get-ChildItem -Path `$edgeBackup -Directory -ErrorAction SilentlyContinue
     foreach (`$prof in `$edgeProfiles) {
@@ -916,14 +969,14 @@ function Backup-Files() {
         
         Write-Host "  Found $fileCount files to copy..." -ForegroundColor Gray
         
-        # Copy files with progress
-        $copyResult = Copy-FilesWithProgress -sourcePath $sourcePath -destPath $destPath -folderName $folder
+        # Copy files with progress (/V for Documents to verify written data)
+        $copyResult = Copy-FilesWithProgress -sourcePath $sourcePath -destPath $destPath -folderName $folder -verifyWritten:($folder -eq "Documents")
         
         if ($copyResult.Success) {
             Write-Host "  Copy completed: $($copyResult.Copied) files" -ForegroundColor Green
             
-            # Verify the copy
-            Write-Host "  Verifying copy..." -ForegroundColor Gray
+            # Verify the copy (file count and sizes - ensures data transferred, not empty files)
+            Write-Host "  Verifying copy (file count and sizes)..." -ForegroundColor Gray
             $verifyResult = Verify-Copy -sourcePath $sourcePath -destPath $destPath
             
             if ($verifyResult.Success) {
@@ -962,19 +1015,53 @@ function Backup-Files() {
     Backup-Printers $backupFolder
     Write-Host ""
     
-    # Backup Chrome and Edge bookmarks, profiles, and passwords
+    # Backup Chrome and Edge (force-close browsers first to avoid corruption and Chrome "reset bookmarks" on restore)
+    if (Test-BrowserProcessRunning) {
+        Write-Host "[Extra] Closing Chrome and Edge so browser data can be backed up safely..." -ForegroundColor Cyan
+        Stop-BrowserProcesses | Out-Null
+    }
     Write-Host "[Extra] Backing up Chrome bookmarks/profiles/passwords..." -ForegroundColor Cyan
     Backup-Chrome $backupFolder
     Write-Host "[Extra] Backing up Edge bookmarks/profiles/passwords..." -ForegroundColor Cyan
     Backup-Edge $backupFolder
     Write-Host ""
     
-    # Backup C:\Scans if present
+    # Backup C:\Scans and C:\Boardmaker (with verification)
     Write-Host "[Extra] Checking for C:\Scans folder..." -ForegroundColor Cyan
-    Backup-Scans $backupFolder
+    $scansResult = Backup-Scans $backupFolder
+    if ($scansResult) { $verificationResults += $scansResult }
     Write-Host "[Extra] Backing up C:\Boardmaker (if present)..." -ForegroundColor Cyan
-    Backup-Boardmaker $backupFolder
+    $boardmakerResult = Backup-Boardmaker $backupFolder
+    if ($boardmakerResult) { $verificationResults += $boardmakerResult }
     Write-Host ""
+    
+    # Final verification: re-run Verify-Copy on every backed-up folder (user folders + Scans + Boardmaker)
+    if ($verificationResults.Count -gt 0) {
+        Write-Host "Verifying all backup folders (file count and sizes)..." -ForegroundColor Cyan
+        $userFolders = @("Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos")
+        $updatedResults = @()
+        foreach ($result in $verificationResults) {
+            $name = $result.Folder
+            $src = $null
+            $dest = Join-Path $backupFolder $name
+            if ($userFolders -contains $name) {
+                $src = Join-Path $UserProfile $name
+            } elseif ($name -eq "Scans") {
+                if (Test-Path "C:\Scans") { $src = "C:\Scans" } elseif (Test-Path "C:\scans") { $src = "C:\scans" }
+            } elseif ($name -eq "Boardmaker") {
+                if (Test-Path "C:\Boardmaker") { $src = "C:\Boardmaker" } elseif (Test-Path "C:\boardmaker") { $src = "C:\boardmaker" }
+            }
+            if (-not $src -or -not (Test-Path $dest)) {
+                $updatedResults += $result
+                continue
+            }
+            $v = Verify-Copy -sourcePath $src -destPath $dest
+            $updatedResults += @{ Folder = $name; Status = if ($v.Success) { "Success" } else { "Failed" }; Message = $v.Message }
+        }
+        $verificationResults = $updatedResults
+        Write-Host "  All backup folders verified." -ForegroundColor Green
+        Write-Host ""
+    }
     
     # Backup list of installed apps (excluding common ones)
     Write-Host "[Extra] Backing up installed apps list..." -ForegroundColor Cyan
