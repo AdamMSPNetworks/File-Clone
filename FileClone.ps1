@@ -27,7 +27,6 @@ function Test-OneDriveSync($folderPath) {
         $shellFoldersPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
         if (Test-Path $shellFoldersPath) {
             $folderName = Split-Path $folderPath -Leaf
-            $registryKeys = @("Desktop", "Personal", "My Pictures", "My Music", "My Video")
             $registryMap = @{
                 "Desktop" = "Desktop"
                 "Documents" = "Personal"
@@ -148,12 +147,9 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
             return @{ Success = $true; Copied = 0; Failed = 0 }
         }
         
-        # Calculate total size
+        # Calculate total size (optimized using Measure-Object)
         Write-Host "  Calculating total size..." -ForegroundColor Gray
-        $totalSize = 0
-        foreach ($file in $allFiles) {
-            $totalSize += $file.Length
-        }
+        $totalSize = ($allFiles | Measure-Object -Property Length -Sum).Sum
         $totalSizeGB = [math]::Round($totalSize / 1GB, 2)
         $copiedSize = 0
         
@@ -166,9 +162,6 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
         
         # Control flags
         $isCancelled = $false
-        
-        # Set up keyboard input monitoring for cancel
-        $cancelRequested = $false
         
         # Start background process to monitor for cancel
         $inputFile = Join-Path $env:TEMP "FileClone_Cancel_$PID.txt"
@@ -185,7 +178,9 @@ function Copy-FilesWithProgress($sourcePath, $destPath, $folderName) {
                             break
                         }
                     }
-                } catch {}
+                } catch {
+                    # Ignore keyboard errors
+                }
                 Start-Sleep -Milliseconds 100
             }
         } -ArgumentList $inputFile
@@ -337,11 +332,39 @@ function Find-ExternalDrive() {
     Write-Host "`nScanning for external drives..." -ForegroundColor Cyan
     
     try {
-        # Get all removable and external drives (USB, External SSD, etc.)
+        # First: find all logical drives that belong to USB physical disks (e.g. Crucial X9, external SSDs)
+        $usbDriveLetters = @()
+        $diskDrives = Get-WmiObject Win32_DiskDrive -ErrorAction SilentlyContinue
+        foreach ($disk in $diskDrives) {
+            $isUsb = $false
+            if ($disk.InterfaceType -eq "USB") { $isUsb = $true }
+            if (-not $isUsb -and $disk.PNPDeviceID -like "*USB*") { $isUsb = $true }
+            if (-not $isUsb) { continue }
+            $partitions = Get-WmiObject Win32_DiskDriveToDiskPartition -ErrorAction SilentlyContinue | Where-Object { $_.Antecedent.DeviceID -eq $disk.DeviceID }
+            foreach ($part in $partitions) {
+                $partDeviceId = $part.Dependent.DeviceID
+                $logicalDisks = Get-WmiObject Win32_LogicalDiskToPartition -ErrorAction SilentlyContinue | Where-Object { $_.Antecedent.DeviceID -eq $partDeviceId }
+                foreach ($ld in $logicalDisks) {
+                    $letter = $ld.Dependent.DeviceID
+                    if ($letter -and $letter -ne $env:SystemDrive) { $usbDriveLetters += $letter }
+                }
+            }
+        }
+        
+        # Build list: USB-derived drives + removable (DriveType 2) + fixed external under 4TB (catch external SSDs not reported as USB in WMI)
+        $systemDrive = $env:SystemDrive
         $drives = Get-WmiObject Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { 
-            $_.DriveType -eq 2 -or  # Removable (USB)
-            ($_.DriveType -eq 3 -and $_.Size -lt 500GB)  # Fixed disk but likely external SSD
-        } | Where-Object { $_.DeviceID -ne $env:SystemDrive }
+            $_.DeviceID -ne $systemDrive -and (
+                $_.DeviceID -in $usbDriveLetters -or
+                $_.DriveType -eq 2 -or
+                ($_.DriveType -eq 3 -and $_.Size -lt 4TB)
+            )
+        } | Sort-Object -Property DeviceID -Unique
+        
+        # If we found USB drives by physical disk, prefer those (exact match)
+        if ($usbDriveLetters.Count -gt 0) {
+            $drives = $drives | Where-Object { $_.DeviceID -in $usbDriveLetters }
+        }
         
         if ($drives.Count -eq 0) {
             Write-Host "No external drives found. Please connect an external SSD/USB drive and try again." -ForegroundColor Red
@@ -389,139 +412,194 @@ function Find-ExternalDrive() {
     }
 }
 
-# Function to backup printers and drivers (using Printbrm.exe like Print Management / printmanagement.msc)
+# Function to backup printers with drivers (PrintBrm like Print Management) plus CSV fallback
 function Backup-Printers($backupFolder) {
-    Write-Host "`nBacking up printers and drivers..." -ForegroundColor Cyan
-    
+    $printersDir = Join-Path $backupFolder "Printers"
+    New-Item -ItemType Directory -Path $printersDir -Force | Out-Null
+    $printBrmExe = Join-Path $env:windir "System32\spool\tools\PrintBrm.exe"
+    # PrintBrm does not support paths with spaces; use temp path then copy
+    $tempPrintBrm = Join-Path $env:TEMP "FileClonePrintBrm"
+    if (-not (Test-Path $tempPrintBrm)) { New-Item -ItemType Directory -Path $tempPrintBrm -Force | Out-Null }
+    $tempBackupFile = Join-Path $tempPrintBrm "PrintersBackup"
     try {
         $printers = @()
-        $drivers = @()
-        $ports = @()
-        
-        # Get all printers for JSON manifest and count
-        $allPrinters = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "Microsoft XPS*" -and $_.Name -notlike "Send To*" }
-        
-        if ($allPrinters.Count -eq 0) {
-            Write-Host "  No printers found to backup." -ForegroundColor Yellow
-            return $true
-        }
-        
-        Write-Host "  Found $($allPrinters.Count) printer(s)..." -ForegroundColor Gray
-        
-        # Use Printbrm.exe (same engine as printmanagement.msc) to export printers WITH driver files
-        $printbrmPath = Join-Path $env:windir "System32\spool\tools\printbrm.exe"
-        $exportFile = Join-Path $backupFolder "Printers.printerExport"
-        
-        if (Test-Path $printbrmPath) {
-            # Printbrm does not support paths with spaces; use temp path if needed then copy
-            $pathHasSpaces = $backupFolder -match ' '
-            $targetPath = $exportFile
-            
-            if ($pathHasSpaces) {
-                $tempExport = Join-Path $env:TEMP "FileClonePrinters.printerExport"
-                $targetPath = $tempExport
-                Write-Host "  Backup path contains spaces; using temp location then copying..." -ForegroundColor Gray
-            }
-            
-            try {
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = $printbrmPath
-                $psi.Arguments = "-b -f `"$targetPath`" -o force"
-                $psi.UseShellExecute = $false
-                $psi.CreateNoWindow = $true
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $p = [System.Diagnostics.Process]::Start($psi)
-                $out = $p.StandardOutput.ReadToEnd()
-                $err = $p.StandardError.ReadToEnd()
-                $p.WaitForExit(120000)
-                
-                if ($p.ExitCode -eq 0) {
-                    if ($pathHasSpaces -and (Test-Path $tempExport)) {
-                        Copy-Item -Path $tempExport -Destination $exportFile -Force
-                        Remove-Item -Path $tempExport -Force -ErrorAction SilentlyContinue
-                    }
-                    Write-Host "  Printers and drivers backed up with Printbrm (like Print Management): Printers.printerExport" -ForegroundColor Green
-                    Write-Host "  This file includes printer definitions and driver files for restore." -ForegroundColor Gray
-                } else {
-                    Write-Host "  Printbrm backup returned exit code $($p.ExitCode); saving JSON manifest only." -ForegroundColor Yellow
-                    if ($err) { Write-Host "  $err" -ForegroundColor Gray }
-                }
-            } catch {
-                Write-Host "  Printbrm backup failed: $($_.Exception.Message); saving JSON manifest only." -ForegroundColor Yellow
-            }
+        if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+            $printers = Get-Printer -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith("Microsoft ") -and $_.Name -ne "Fax" }
         } else {
-            Write-Host "  Printbrm.exe not found; saving printer list and driver metadata only (no driver files)." -ForegroundColor Yellow
+            $printers = Get-WmiObject Win32_Printer -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith("Microsoft ") -and $_.Name -ne "Fax" -and $_.System -eq $false }
         }
-        
-        # Build JSON manifest (printer list + driver/port metadata) for reference and fallback restore
-        foreach ($printer in $allPrinters) {
-            $printerInfo = @{
-                Name = $printer.Name
-                DriverName = $printer.DriverName
-                PortName = $printer.PortName
-                Shared = $printer.Shared
-                ShareName = $printer.ShareName
-                Location = $printer.Location
-                Comment = $printer.Comment
-                PrinterStatus = $printer.PrinterStatus
-                Published = $printer.Published
+        # Always save CSV for reference
+        $rows = @()
+        foreach ($p in $printers) {
+            $rows += [PSCustomObject]@{ PrinterName = $p.Name; DriverName = $p.DriverName; PortName = $p.PortName }
+        }
+        $csvPath = Join-Path $printersDir "printers.csv"
+        if ($rows.Count -gt 0) {
+            $rows | Export-Csv -Path $csvPath -NoTypeInformation -Force
+        }
+        # Full backup with drivers via PrintBrm (requires elevation for driver export)
+        if ($printers.Count -gt 0 -and (Test-Path $printBrmExe)) {
+            Remove-Item -Path "$tempBackupFile*" -Force -ErrorAction SilentlyContinue
+            $proc = Start-Process -FilePath $printBrmExe -ArgumentList "-b", "-f", $tempBackupFile, "-o", "force" -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -eq 0) {
+                $created = Get-ChildItem -Path $tempPrintBrm -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "PrintersBackup*" }
+                foreach ($f in $created) {
+                    $dest = Join-Path $printersDir $f.Name
+                    if ($f.PSIsContainer) { Copy-Item -Path $f.FullName -Destination $dest -Recurse -Force } else { Copy-Item -Path $f.FullName -Destination $dest -Force }
+                }
+                Write-Host "  Backed up $($rows.Count) printer(s) with drivers (PrintBrm) and printers.csv" -ForegroundColor Green
+            } else {
+                Write-Host "  PrintBrm backup failed (exit $($proc.ExitCode)); list saved to printers.csv. Run script as Administrator for full driver backup." -ForegroundColor Yellow
             }
-            
-            try {
-                $port = Get-PrinterPort -Name $printer.PortName -ErrorAction SilentlyContinue
-                if ($port -and -not ($ports | Where-Object { $_.Name -eq $port.Name })) {
-                    $ports += @{
-                        Name = $port.Name
-                        Description = $port.Description
-                        PrinterHostAddress = $port.PrinterHostAddress
-                        PortNumber = $port.PortNumber
-                        SNMPEnabled = $port.SNMPEnabled
-                        SNMPCommunity = $port.SNMPCommunity
-                        SNMPDeviceIndex = $port.SNMPDeviceIndex
-                    }
-                }
-            } catch { }
-            
-            try {
-                $driver = Get-PrinterDriver -Name $printer.DriverName -ErrorAction SilentlyContinue
-                if ($driver -and -not ($drivers | Where-Object { $_.Name -eq $driver.Name })) {
-                    $drivers += @{
-                        Name = $driver.Name
-                        PrinterEnvironment = $driver.PrinterEnvironment
-                        DriverPath = $driver.DriverPath
-                        ConfigFile = $driver.ConfigFile
-                        DataFile = $driver.DataFile
-                        HelpFile = $driver.HelpFile
-                        InfPath = $driver.InfPath
-                        MajorVersion = $driver.MajorVersion
-                        MinorVersion = $driver.MinorVersion
-                    }
-                }
-            } catch { }
-            
-            $printers += $printerInfo
+        } elseif ($rows.Count -gt 0) {
+            Write-Host "  Backed up $($rows.Count) printer(s) to Printers\printers.csv (PrintBrm not found; restore will use CSV)." -ForegroundColor Green
+        } else {
+            Write-Host "  No user printers to backup." -ForegroundColor Gray
         }
-        
-        $printerBackup = @{
-            Printers = $printers
-            Drivers = $drivers
-            Ports = $ports
-            BackupDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            ComputerName = $env:COMPUTERNAME
-        }
-        
-        $printerBackupPath = Join-Path $backupFolder "Printers.json"
-        $printerBackup | ConvertTo-Json -Depth 10 | Set-Content -Path $printerBackupPath -Force
-        
-        Write-Host "  Printers: $($printers.Count) | Drivers (metadata): $($drivers.Count) | Ports: $($ports.Count)" -ForegroundColor Green
-        Write-Host "  Manifest saved to: Printers.json" -ForegroundColor Green
-        
-        return $true
     } catch {
-        Write-Host "  Error backing up printers: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "  Run as Administrator for full printer/driver backup." -ForegroundColor Yellow
-        return $false
+        Write-Host "  Printer backup error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Remove-Item -Path "$tempBackupFile*" -Force -ErrorAction SilentlyContinue
+}
+
+# Key files to backup for Chrome/Edge (bookmarks, preferences, passwords)
+$BrowserProfileFiles = @("Bookmarks", "Bookmarks.bak", "Preferences", "Secure Preferences", "Web Data", "Login Data", "Login Data-journal")
+
+# Function to backup Chrome bookmarks, profile data, and passwords
+function Backup-Chrome($backupFolder) {
+    $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    if (-not (Test-Path $chromeUserData)) {
+        Write-Host "  Chrome User Data not found, skipping." -ForegroundColor Gray
+        return
+    }
+    $chromeDest = Join-Path $backupFolder "Chrome"
+    New-Item -ItemType Directory -Path $chromeDest -Force | Out-Null
+    $profiles = @("Default")
+    $profiles += Get-ChildItem -Path $chromeUserData -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^Profile \d+$" } | ForEach-Object { $_.Name }
+    $copied = 0
+    foreach ($profile in $profiles) {
+        $srcProfile = Join-Path $chromeUserData $profile
+        if (-not (Test-Path $srcProfile)) { continue }
+        $destProfile = Join-Path $chromeDest $profile
+        New-Item -ItemType Directory -Path $destProfile -Force | Out-Null
+        foreach ($f in $BrowserProfileFiles) {
+            $srcFile = Join-Path $srcProfile $f
+            if (Test-Path $srcFile) {
+                try {
+                    Copy-Item -Path $srcFile -Destination (Join-Path $destProfile $f) -Force
+                    $copied++
+                } catch { }
+            }
+        }
+    }
+    if ($copied -gt 0) {
+        Write-Host "  Backed up Chrome data including passwords ($copied files from $($profiles.Count) profile(s))." -ForegroundColor Green
+    } else {
+        Write-Host "  No Chrome bookmarks/profile files found." -ForegroundColor Gray
+    }
+}
+
+# Function to backup Edge bookmarks, profile data, and passwords
+function Backup-Edge($backupFolder) {
+    $edgeUserData = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data"
+    if (-not (Test-Path $edgeUserData)) {
+        Write-Host "  Edge User Data not found, skipping." -ForegroundColor Gray
+        return
+    }
+    $edgeDest = Join-Path $backupFolder "Edge"
+    New-Item -ItemType Directory -Path $edgeDest -Force | Out-Null
+    $profiles = @("Default")
+    $profiles += Get-ChildItem -Path $edgeUserData -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^Profile \d+$" } | ForEach-Object { $_.Name }
+    $copied = 0
+    foreach ($profile in $profiles) {
+        $srcProfile = Join-Path $edgeUserData $profile
+        if (-not (Test-Path $srcProfile)) { continue }
+        $destProfile = Join-Path $edgeDest $profile
+        New-Item -ItemType Directory -Path $destProfile -Force | Out-Null
+        foreach ($f in $BrowserProfileFiles) {
+            $srcFile = Join-Path $srcProfile $f
+            if (Test-Path $srcFile) {
+                try {
+                    Copy-Item -Path $srcFile -Destination (Join-Path $destProfile $f) -Force
+                    $copied++
+                } catch { }
+            }
+        }
+    }
+    if ($copied -gt 0) {
+        Write-Host "  Backed up Edge data including passwords ($copied files from $($profiles.Count) profile(s))." -ForegroundColor Green
+    } else {
+        Write-Host "  No Edge bookmarks/profile files found." -ForegroundColor Gray
+    }
+}
+
+# Common app names to exclude from installed-apps list (case-insensitive partial match)
+$CommonAppsExclude = @(
+    "Google Chrome", "Chrome", "7-Zip", "7zip", "VLC", "VLC Player", "Adobe Acrobat Reader", "Acrobat Reader",
+    "Zoom", "Microsoft Edge", "Edge", "Windows Security", "Windows Update", "Microsoft Store",
+    "Cortana", "OneDrive", "Skype", "Teams", "Microsoft Office", "Spotify", "iTunes", "iCloud",
+    "Firefox", "Mozilla Firefox", "Opera", "CCleaner", "Java Auto Updater", "Java(TM)",
+    "Microsoft Visual C++", "Visual Studio", ".NET Framework", "Windows SDK", "Windows Defender"
+)
+
+# Function to backup list of installed apps (excluding common apps)
+function Backup-InstalledApps($backupFolder) {
+    $appsDir = Join-Path $backupFolder "InstalledApps"
+    New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
+    $outPath = Join-Path $appsDir "InstalledApps.txt"
+    try {
+        $allApps = @()
+        $uninstallKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        foreach ($key in $uninstallKeys) {
+            if (-not (Test-Path $key -ErrorAction SilentlyContinue)) { continue }
+            Get-ItemProperty -Path $key -ErrorAction SilentlyContinue | ForEach-Object {
+                $name = $_.DisplayName
+                if (-not $name) { return }
+                $allApps += $name
+            }
+        }
+        $filtered = $allApps | Sort-Object -Unique | Where-Object {
+            $app = $_
+            $exclude = $false
+            foreach ($pattern in $CommonAppsExclude) {
+                if ($app -like "*$pattern*") { $exclude = $true; break }
+            }
+            -not $exclude
+        }
+        $filtered | Set-Content -Path $outPath -Force
+        Write-Host "  Saved $($filtered.Count) installed apps (excluding common) to InstalledApps\InstalledApps.txt" -ForegroundColor Green
+    } catch {
+        Write-Host "  Installed apps backup error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# Function to backup C:\Scans or C:\scans if present
+function Backup-Scans($backupFolder) {
+    $scansPath = $null
+    if (Test-Path "C:\Scans") { $scansPath = "C:\Scans" }
+    elseif (Test-Path "C:\scans") { $scansPath = "C:\scans" }
+    if (-not $scansPath) {
+        Write-Host "  C:\Scans folder not found, skipping." -ForegroundColor Gray
+        return
+    }
+    $destScans = Join-Path $backupFolder "Scans"
+    $fileCount = (Get-ChildItem -Path $scansPath -Recurse -File -ErrorAction SilentlyContinue).Count
+    if ($fileCount -eq 0) {
+        New-Item -ItemType Directory -Path $destScans -Force | Out-Null
+        Write-Host "  Backed up Scans folder (empty)." -ForegroundColor Green
+        return
+    }
+    Write-Host "  Copying Scans folder ($fileCount files)..." -ForegroundColor Gray
+    $robocopyArgs = @("`"$scansPath`"", "`"$destScans`"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
+    $proc = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait
+    if ($proc.ExitCode -le 7) {
+        Write-Host "  Backed up Scans folder ($fileCount files)." -ForegroundColor Green
+    } else {
+        Write-Host "  Scans backup had errors (robocopy exit $($proc.ExitCode))." -ForegroundColor Yellow
     }
 }
 
@@ -534,11 +612,13 @@ function Create-RestoreScript($backupFolder) {
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "   FILE CLONE RESTORE" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Restores: user folders, printers, Chrome & Edge (bookmarks, profiles, passwords), C:\Scans" -ForegroundColor Gray
+Write-Host "For printer restore, run as Administrator if add fails." -ForegroundColor Gray
 Write-Host ""
 
 `$UserProfile = [System.Environment]::GetFolderPath("UserProfile")
 `$FoldersToRestore = @("Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos")
-`$backupPath = Split-Path -Parent `$PSScriptRoot
+`$backupPath = `$PSScriptRoot
 
 Write-Host "Restoring files to: `$UserProfile" -ForegroundColor Yellow
 Write-Host "Source: `$backupPath" -ForegroundColor Yellow
@@ -566,11 +646,8 @@ foreach (`$folder in `$FoldersToRestore) {
             continue
         }
         
-        # Calculate total size
-        `$totalSize = 0
-        foreach (`$file in `$files) {
-            `$totalSize += `$file.Length
-        }
+        # Calculate total size (optimized using Measure-Object)
+        `$totalSize = (`$files | Measure-Object -Property Length -Sum).Sum
         `$totalSizeGB = [math]::Round(`$totalSize / 1GB, 2)
         
         Write-Host "  Found `$totalFiles files (`$totalSizeGB GB)..." -ForegroundColor Gray
@@ -581,10 +658,10 @@ foreach (`$folder in `$FoldersToRestore) {
                 New-Item -ItemType Directory -Path `$dest -Force | Out-Null
             }
             
-            # Use robocopy for fast, reliable copying
+            # Use robocopy for fast, reliable copying (quoted paths for spaces in username)
             `$robocopyArgs = @(
-                "`"`$src`"",
-                "`"`$dest`"",
+                "``"`$src``"",
+                "``"`$dest``"",
                 "/E",           # Copy subdirectories including empty ones
                 "/MT:4",        # Multi-threaded with 4 threads
                 "/R:1",         # Retry 1 time on failure
@@ -616,119 +693,97 @@ foreach (`$folder in `$FoldersToRestore) {
     }
 }
 
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Restoring Printers..." -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-`$printerExportPath = "`$backupPath\Printers.printerExport"
-`$printerJsonPath = "`$backupPath\Printers.json"
-
-# Prefer Printbrm restore (same as Print Management: restores printers AND driver files)
-if (Test-Path `$printerExportPath) {
-    Write-Host "Found Printers.printerExport (full backup with drivers, like Print Management)." -ForegroundColor Cyan
-    
-    `$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not `$isAdmin) {
-        Write-Host "  Warning: Run as Administrator to restore printers and drivers." -ForegroundColor Yellow
-    } else {
-        `$printbrmPath = Join-Path `$env:windir "System32\spool\tools\printbrm.exe"
-        if (Test-Path `$printbrmPath) {
-            # Printbrm does not support paths with spaces; use temp copy if needed
-            `$pathHasSpaces = `$printerExportPath -match ' '
-            `$restorePath = `$printerExportPath
-            if (`$pathHasSpaces) {
-                `$tempRestore = Join-Path `$env:TEMP "FileClonePrinters.printerExport"
-                Copy-Item -Path `$printerExportPath -Destination `$tempRestore -Force
-                `$restorePath = `$tempRestore
-            }
-            try {
-                `$psi = New-Object System.Diagnostics.ProcessStartInfo
-                `$psi.FileName = `$printbrmPath
-                `$psi.Arguments = "-r -f `"`$restorePath`" -o force"
-                `$psi.UseShellExecute = `$false
-                `$psi.CreateNoWindow = `$true
-                `$psi.RedirectStandardOutput = `$true
-                `$psi.RedirectStandardError = `$true
-                `$p = [System.Diagnostics.Process]::Start(`$psi)
-                `$p.WaitForExit(120000)
-                if (`$p.ExitCode -eq 0) {
-                    Write-Host "  Printers and drivers restored successfully (Printbrm)." -ForegroundColor Green
-                } else {
-                    Write-Host "  Printbrm restore returned exit code `$(`$p.ExitCode)." -ForegroundColor Yellow
+# Restore printers: prefer PrintBrm (with drivers), else CSV fallback
+`$printersDir = "`$backupPath\Printers"
+`$printBrmExe = Join-Path `$env:windir "System32\spool\tools\PrintBrm.exe"
+`$printBrmSucceeded = `$false
+`$printBrmBackup = Get-ChildItem -Path `$printersDir -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like "PrintersBackup*" -and `$_.Name -ne "printers.csv" } | Select-Object -First 1
+if (`$printBrmBackup -and (Test-Path `$printBrmExe)) {
+    Write-Host "Restoring printers with drivers (PrintBrm)..." -ForegroundColor Cyan
+    `$tempPrintBrm = Join-Path `$env:TEMP "FileClonePrintBrmRestore"
+    if (-not (Test-Path `$tempPrintBrm)) { New-Item -ItemType Directory -Path `$tempPrintBrm -Force | Out-Null }
+    `$tempFile = Join-Path `$tempPrintBrm `$printBrmBackup.Name
+    if (`$printBrmBackup.PSIsContainer) { Copy-Item -Path `$printBrmBackup.FullName -Destination `$tempFile -Recurse -Force } else { Copy-Item -Path `$printBrmBackup.FullName -Destination `$tempFile -Force }
+    `$proc = Start-Process -FilePath `$printBrmExe -ArgumentList "-r", "-f", `$tempFile, "-o", "force" -Wait -PassThru -NoNewWindow
+    Remove-Item -Path `$tempFile -Recurse -Force -ErrorAction SilentlyContinue
+    if (`$proc.ExitCode -eq 0) { `$printBrmSucceeded = `$true; Write-Host "  Printers restored with drivers." -ForegroundColor Green } else { Write-Host "  PrintBrm restore failed (exit `$(`$proc.ExitCode)). Trying CSV fallback." -ForegroundColor Yellow }
+}
+`$printersCsv = "`$printersDir\printers.csv"
+if ((Test-Path `$printersCsv) -and -not `$printBrmSucceeded) {
+    Write-Host "Restoring printers from list (printers.csv)..." -ForegroundColor Cyan
+    `$printerRows = Import-Csv -Path `$printersCsv -ErrorAction SilentlyContinue
+    foreach (`$row in `$printerRows) {
+        try {
+            if (Get-Command Add-Printer -ErrorAction SilentlyContinue) {
+                `$portName = `$row.PortName
+                if (Get-Command Add-PrinterPort -ErrorAction SilentlyContinue) {
+                    `$portExists = Get-PrinterPort -Name `$portName -ErrorAction SilentlyContinue
+                    if (-not `$portExists -and `$portName -match '\d+\.\d+\.\d+\.\d+') {
+                        `$ip = if (`$portName -match 'IP_(.+)') { `$Matches[1] } else { `$portName }
+                        Add-PrinterPort -Name `$portName -PrinterHostAddress `$ip -ErrorAction SilentlyContinue
+                    }
                 }
-            } catch {
-                Write-Host "  Printbrm restore failed: `$(`$_.Exception.Message)" -ForegroundColor Red
+                Add-Printer -Name `$row.PrinterName -DriverName `$row.DriverName -PortName `$portName -ErrorAction Stop
+                Write-Host "  Added printer: `$(`$row.PrinterName)" -ForegroundColor Green
             }
-            if (`$pathHasSpaces -and (Test-Path `$tempRestore)) { Remove-Item `$tempRestore -Force -ErrorAction SilentlyContinue }
-        } else {
-            Write-Host "  Printbrm.exe not found; cannot restore from .printerExport." -ForegroundColor Yellow
+        } catch {
+            Write-Host "  Could not add printer '`$(`$row.PrinterName)': `$(`$_.Exception.Message)" -ForegroundColor Yellow
         }
     }
-} elseif (Test-Path `$printerJsonPath) {
-    Write-Host "Found printer manifest (Printers.json); restoring printers (drivers must be installed if missing)..." -ForegroundColor Cyan
-    
-    try {
-        `$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if (-not `$isAdmin) {
-            Write-Host "  Warning: Not running as Administrator. Printer restore may fail." -ForegroundColor Yellow
+}
+if (-not (Test-Path `$printersDir)) { Write-Host "No printer backup found, skipping." -ForegroundColor Gray }
+
+# Restore Chrome and Edge (bookmarks, profiles, passwords - close browsers first)
+`$chromeBackup = "`$backupPath\Chrome"
+`$chromeUserData = Join-Path `$env:LOCALAPPDATA "Google\Chrome\User Data"
+if (Test-Path `$chromeBackup) {
+    Write-Host "Restoring Chrome (bookmarks, profiles, passwords)..." -ForegroundColor Cyan
+    Write-Host "  (Close Chrome if it is running)" -ForegroundColor Gray
+    if (-not (Test-Path `$chromeUserData)) { New-Item -ItemType Directory -Path `$chromeUserData -Force | Out-Null }
+    `$chromeProfiles = Get-ChildItem -Path `$chromeBackup -Directory -ErrorAction SilentlyContinue
+    foreach (`$prof in `$chromeProfiles) {
+        `$destProfile = Join-Path `$chromeUserData `$prof.Name
+        if (-not (Test-Path `$destProfile)) { New-Item -ItemType Directory -Path `$destProfile -Force | Out-Null }
+        Get-ChildItem -Path `$prof.FullName -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item -Path `$_.FullName -Destination (Join-Path `$destProfile `$_.Name) -Force -ErrorAction SilentlyContinue
         }
-        
-        `$printerBackup = Get-Content -Path `$printerJsonPath -Raw | ConvertFrom-Json
-        
-        # Restore ports (ensure array for single vs multiple ports)
-        `$portsList = @(`$printerBackup.Ports)
-        if (`$portsList -and `$portsList.Count -gt 0) {
-            foreach (`$port in `$portsList) {
-                if (-not `$port -or -not `$port.Name) { continue }
-                try {
-                    `$existingPort = Get-PrinterPort -Name `$port.Name -ErrorAction SilentlyContinue
-                    if (-not `$existingPort) {
-                        if (`$port.PrinterHostAddress) {
-                            Add-PrinterPort -Name `$port.Name -PrinterHostAddress `$port.PrinterHostAddress -PortNumber $(if (`$port.PortNumber) { `$port.PortNumber } else { 9100 }) -ErrorAction Stop
-                        } else {
-                            Add-PrinterPort -Name `$port.Name -ErrorAction Stop
-                        }
-                    }
-                } catch { }
-            }
-        }
-        
-        `$restoredCount = 0
-        `$failedCount = 0
-        `$printersList = @(`$printerBackup.Printers)
-        foreach (`$printer in `$printersList) {
-            if (-not `$printer -or -not `$printer.Name) { continue }
-            try {
-                if (Get-Printer -Name `$printer.Name -ErrorAction SilentlyContinue) { continue }
-                `$portExists = Get-PrinterPort -Name `$printer.PortName -ErrorAction SilentlyContinue
-                if (-not `$portExists -and `$printer.PortName -match '^\d+\.\d+\.\d+\.\d+') {
-                    Add-PrinterPort -Name `$printer.PortName -PrinterHostAddress `$printer.PortName -PortNumber 9100 -ErrorAction SilentlyContinue
-                }
-                `$driverExists = Get-PrinterDriver -Name `$printer.DriverName -ErrorAction SilentlyContinue
-                if (-not `$driverExists) {
-                    Write-Host "  Driver `$(`$printer.DriverName) not found for `$(`$printer.Name); skip or install driver." -ForegroundColor Yellow
-                    `$failedCount++
-                    continue
-                }
-                `$printerArgs = @{ Name = `$printer.Name; DriverName = `$printer.DriverName; PortName = `$printer.PortName }
-                if (`$printer.Shared) { `$printerArgs.Shared = `$true; if (`$printer.ShareName) { `$printerArgs.ShareName = `$printer.ShareName } }
-                if (`$printer.Location) { `$printerArgs.Location = `$printer.Location }; if (`$printer.Comment) { `$printerArgs.Comment = `$printer.Comment }
-                Add-Printer @printerArgs -ErrorAction Stop
-                Write-Host "  Printer `$(`$printer.Name) restored." -ForegroundColor Green
-                `$restoredCount++
-            } catch {
-                Write-Host "  Error restoring `$(`$printer.Name): `$(`$_.Exception.Message)" -ForegroundColor Red
-                `$failedCount++
-            }
-        }
-        Write-Host "  Restored: `$restoredCount | Failed: `$failedCount" -ForegroundColor Cyan
-    } catch {
-        Write-Host "  Error restoring from JSON: `$(`$_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Restored Chrome profile: `$(`$prof.Name)" -ForegroundColor Green
     }
 } else {
-    Write-Host "No printer backup found (Printers.printerExport or Printers.json)." -ForegroundColor Yellow
+    Write-Host "No Chrome backup found, skipping." -ForegroundColor Gray
+}
+
+# Restore Edge bookmarks, profile data, and passwords
+`$edgeBackup = "`$backupPath\Edge"
+`$edgeUserData = Join-Path `$env:LOCALAPPDATA "Microsoft\Edge\User Data"
+if (Test-Path `$edgeBackup) {
+    Write-Host "Restoring Edge (bookmarks, profiles, passwords)..." -ForegroundColor Cyan
+    Write-Host "  (Close Edge if it is running)" -ForegroundColor Gray
+    if (-not (Test-Path `$edgeUserData)) { New-Item -ItemType Directory -Path `$edgeUserData -Force | Out-Null }
+    `$edgeProfiles = Get-ChildItem -Path `$edgeBackup -Directory -ErrorAction SilentlyContinue
+    foreach (`$prof in `$edgeProfiles) {
+        `$destProfile = Join-Path `$edgeUserData `$prof.Name
+        if (-not (Test-Path `$destProfile)) { New-Item -ItemType Directory -Path `$destProfile -Force | Out-Null }
+        Get-ChildItem -Path `$prof.FullName -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item -Path `$_.FullName -Destination (Join-Path `$destProfile `$_.Name) -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "  Restored Edge profile: `$(`$prof.Name)" -ForegroundColor Green
+    }
+} else {
+    Write-Host "No Edge backup found, skipping." -ForegroundColor Gray
+}
+
+# Restore C:\Scans folder
+`$scansBackup = "`$backupPath\Scans"
+if (Test-Path `$scansBackup) {
+    Write-Host "Restoring C:\Scans folder..." -ForegroundColor Cyan
+    `$scansDest = "C:\Scans"
+    if (-not (Test-Path `$scansDest)) { New-Item -ItemType Directory -Path `$scansDest -Force | Out-Null }
+    `$robocopyArgs = @("``"`$scansBackup``"", "``"`$scansDest``"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
+    `$proc = Start-Process -FilePath "robocopy.exe" -ArgumentList `$robocopyArgs -NoNewWindow -PassThru -Wait
+    if (`$proc.ExitCode -le 7) { Write-Host "  Scans folder restored." -ForegroundColor Green } else { Write-Host "  Scans restore had errors." -ForegroundColor Yellow }
+} else {
+    Write-Host "No Scans backup found, skipping." -ForegroundColor Gray
 }
 
 Write-Host ""
@@ -770,9 +825,6 @@ function Backup-Files() {
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         return
     }
-    
-    # Backup printers and drivers first
-    Backup-Printers $backupFolder
     
     # Create restore script
     Create-RestoreScript $backupFolder
@@ -866,6 +918,28 @@ function Backup-Files() {
         Write-Host ""
     }
     
+    # Backup printers
+    Write-Host "[Extra] Backing up printers..." -ForegroundColor Cyan
+    Backup-Printers $backupFolder
+    Write-Host ""
+    
+    # Backup Chrome and Edge bookmarks, profiles, and passwords
+    Write-Host "[Extra] Backing up Chrome bookmarks/profiles/passwords..." -ForegroundColor Cyan
+    Backup-Chrome $backupFolder
+    Write-Host "[Extra] Backing up Edge bookmarks/profiles/passwords..." -ForegroundColor Cyan
+    Backup-Edge $backupFolder
+    Write-Host ""
+    
+    # Backup C:\Scans if present
+    Write-Host "[Extra] Checking for C:\Scans folder..." -ForegroundColor Cyan
+    Backup-Scans $backupFolder
+    Write-Host ""
+    
+    # Backup list of installed apps (excluding common ones)
+    Write-Host "[Extra] Backing up installed apps list..." -ForegroundColor Cyan
+    Backup-InstalledApps $backupFolder
+    Write-Host ""
+    
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host "Backup Summary:" -ForegroundColor Green
@@ -901,8 +975,8 @@ Write-Host "   FILE CLONE - USER FILE TRANSFER" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "This script will backup user files to an external drive." -ForegroundColor White
-Write-Host "Folders to backup: Desktop, Downloads, Documents, Pictures, Music, Videos" -ForegroundColor Gray
-Write-Host "OneDrive synced folders will be automatically skipped." -ForegroundColor Gray
+Write-Host "Folders: Desktop, Downloads, Documents, Pictures, Music, Videos" -ForegroundColor Gray
+Write-Host "Also: Printers (with drivers), Chrome, C:\Scans, installed-apps list (common apps excluded). OneDrive skipped." -ForegroundColor Gray
 Write-Host ""
 Write-Host "[B] Backup Files to External Drive" -ForegroundColor Yellow
 Write-Host "[Q] Quit" -ForegroundColor Yellow
