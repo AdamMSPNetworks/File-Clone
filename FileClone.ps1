@@ -603,6 +603,32 @@ function Backup-Scans($backupFolder) {
     }
 }
 
+# Function to backup C:\Boardmaker or C:\boardmaker if present
+function Backup-Boardmaker($backupFolder) {
+    $boardmakerPath = $null
+    if (Test-Path "C:\Boardmaker") { $boardmakerPath = "C:\Boardmaker" }
+    elseif (Test-Path "C:\boardmaker") { $boardmakerPath = "C:\boardmaker" }
+    if (-not $boardmakerPath) {
+        Write-Host "  C:\Boardmaker folder not found, skipping." -ForegroundColor Gray
+        return
+    }
+    $destBoardmaker = Join-Path $backupFolder "Boardmaker"
+    $fileCount = (Get-ChildItem -Path $boardmakerPath -Recurse -File -ErrorAction SilentlyContinue).Count
+    if ($fileCount -eq 0) {
+        New-Item -ItemType Directory -Path $destBoardmaker -Force | Out-Null
+        Write-Host "  Backed up Boardmaker folder (empty)." -ForegroundColor Green
+        return
+    }
+    Write-Host "  Copying Boardmaker folder ($fileCount files)..." -ForegroundColor Gray
+    $robocopyArgs = @("`"$boardmakerPath`"", "`"$destBoardmaker`"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
+    $proc = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait
+    if ($proc.ExitCode -le 7) {
+        Write-Host "  Backed up Boardmaker folder ($fileCount files)." -ForegroundColor Green
+    } else {
+        Write-Host "  Boardmaker backup had errors (robocopy exit $($proc.ExitCode))." -ForegroundColor Yellow
+    }
+}
+
 # Function to create restore script in backup folder
 function Create-RestoreScript($backupFolder) {
     $restoreScript = @"
@@ -612,7 +638,7 @@ function Create-RestoreScript($backupFolder) {
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "   FILE CLONE RESTORE" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Restores: user folders, printers, Chrome & Edge (bookmarks, profiles, passwords), C:\Scans" -ForegroundColor Gray
+Write-Host "Restores: user folders, printers, Chrome & Edge (bookmarks, profiles, passwords), C:\Scans, C:\Boardmaker" -ForegroundColor Gray
 Write-Host "For printer restore, run as Administrator if add fails." -ForegroundColor Gray
 Write-Host ""
 
@@ -786,6 +812,19 @@ if (Test-Path `$scansBackup) {
     Write-Host "No Scans backup found, skipping." -ForegroundColor Gray
 }
 
+# Restore C:\Boardmaker folder
+`$boardmakerBackup = "`$backupPath\Boardmaker"
+if (Test-Path `$boardmakerBackup) {
+    Write-Host "Restoring C:\Boardmaker folder..." -ForegroundColor Cyan
+    `$boardmakerDest = "C:\Boardmaker"
+    if (-not (Test-Path `$boardmakerDest)) { New-Item -ItemType Directory -Path `$boardmakerDest -Force | Out-Null }
+    `$robocopyArgs = @("``"`$boardmakerBackup``"", "``"`$boardmakerDest``"", "/E", "/MT:4", "/R:1", "/W:1", "/NP", "/NDL", "/NFL", "/NJH", "/NJS")
+    `$proc = Start-Process -FilePath "robocopy.exe" -ArgumentList `$robocopyArgs -NoNewWindow -PassThru -Wait
+    if (`$proc.ExitCode -le 7) { Write-Host "  Boardmaker folder restored." -ForegroundColor Green } else { Write-Host "  Boardmaker restore had errors." -ForegroundColor Yellow }
+} else {
+    Write-Host "No Boardmaker backup found, skipping." -ForegroundColor Gray
+}
+
 Write-Host ""
 Write-Host "Restore completed!" -ForegroundColor Green
 Write-Host "Press any key to exit..."
@@ -933,6 +972,8 @@ function Backup-Files() {
     # Backup C:\Scans if present
     Write-Host "[Extra] Checking for C:\Scans folder..." -ForegroundColor Cyan
     Backup-Scans $backupFolder
+    Write-Host "[Extra] Backing up C:\Boardmaker (if present)..." -ForegroundColor Cyan
+    Backup-Boardmaker $backupFolder
     Write-Host ""
     
     # Backup list of installed apps (excluding common ones)
